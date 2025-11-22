@@ -1,5 +1,31 @@
 import os, json, logging, datetime
 import psycopg2, boto3, requests
+import jwt
+from jwt import InvalidTokenError
+
+class AuthError(Exception):
+    pass
+
+def get_auth_user_id(event) -> int:
+    """
+    Authorization: Bearer <access_token> 헤더에서 user_id(sub) 추출
+    - 토큰 타입(type) == 'access' 체크
+    """
+    headers = (event.get("headers") or {})
+    auth = headers.get("Authorization") or headers.get("authorization") or ""
+    if not auth.startswith("Bearer "):
+        raise AuthError("missing bearer token")
+
+    token = auth.split(" ", 1)[1].strip()
+    try:
+        payload = jwt.decode(token, os.environ["JWT_SECRET_KEY"], algorithms=["HS256"])
+    except jwt.InvalidTokenError as e:
+        raise AuthError(f"invalid token: {e}")
+
+    if payload.get("type") != "access":
+        raise AuthError("invalid token type")
+
+    return int(payload["sub"])
 
 log = logging.getLogger(__name__)
 log.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
@@ -185,6 +211,7 @@ def get_plan_from_gemini(role: str, question: str, focus_list, stats: dict,
 - 문서가 서비스 약관, 계약서, 이용정책 등 “법률 문서”라면 summarizer와 risk를 반드시 포함하라. 
 - 사용자가 질문(question)이나 focus를 입력했으면 qa를 포함하라. 
 - “법무팀”, “검토”, “변호사” 등의 문서를 작성하는 역할(role)이 포함되어 있으면 revision을 포함하라.
+- 문서를 작성하거나 검토하지 않고, 전문 지식 없이 읽는 역할이라면 revision을 포함하지 말아라.
 - 문서가 단순 설명문이나 공지문 수준이라면 summarizer만 포함하라.
 
 ### 출력 형식 (JSON 배열만 반환)
@@ -256,22 +283,54 @@ def invoke_worker_async(worker: str, payload: dict):
     )
 
 # ---------- plan 저장 + run_results 씨딩 ----------
+def _normalize_plan(plan_list: list[str]) -> list[str]:
+    """
+    - 중복 제거
+    - 순서 유지
+    - verifier를 항상 마지막에 포함
+    """
+    seen = set()
+    out: list[str] = []
+    for w in plan_list or []:
+        if isinstance(w, str):
+            w = w.strip()
+        if not w:
+            continue
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
+    if "verifier" not in seen:
+        out.append("verifier")
+    return out
+
+
 def persist_plan_and_seed_results(run_id: int, plan_list: list[str]):
     """
-    - runs.plan 에 계획 저장
+    - runs.plan 에 계획 저장 (verifier 포함된 정규화 plan)
     - run_results 에 worker별 {"status":"queued"} 미리 INSERT (있으면 건너뜀)
     """
+    norm_plan = _normalize_plan(plan_list)
+
     with db() as conn, conn.cursor() as cur:
         # runs.plan 저장
-        cur.execute("UPDATE runs SET plan=%s WHERE id=%s", (json.dumps(plan_list), run_id))
-        # run_results 씨드
-        for w in plan_list:
-            cur.execute("""
+        cur.execute(
+            "UPDATE runs SET plan=%s WHERE id=%s",
+            (json.dumps(norm_plan), run_id),
+        )
+
+        # run_results 씨드 (plan에 있는 워커 + verifier)
+        for w in norm_plan:
+            cur.execute(
+                """
                 INSERT INTO run_results (worker_type, run_id, payload)
                 VALUES (%s, %s, %s::jsonb)
                 ON CONFLICT (run_id, worker_type) DO NOTHING
-            """, (w, run_id, json.dumps({"status":"queued"})))
+                """,
+                (w, run_id, json.dumps({"status": "queued"})),
+            )
         conn.commit()
+
+    return norm_plan
 
 # ---------- 상태 재계산 트리거 ----------
 def trigger_run_tick(run_id: int):
@@ -297,6 +356,12 @@ def lambda_handler(event, context):
         return {"statusCode": 200, "headers": cors_headers()}
 
     try:
+        try:
+            user_id = get_auth_user_id(event)
+        except AuthError as e:
+            return {"statusCode": 401, "headers": cors_headers(),
+                    "body": json.dumps({"ok": False, "error": str(e)})}
+
         # 1) pathParameters.sessionId
         path_params = (event.get("pathParameters") or {}) if isinstance(event, dict) else {}
         session_id_str = path_params.get("sessionId") or path_params.get("session_id")
@@ -317,6 +382,9 @@ def lambda_handler(event, context):
         answers_in = body.get("answers", {}) or {}
         base_run_id = body.get("baseRunId")
 
+        # reanalyze/기타 옵션 전달용 inputs
+        extra_inputs = body.get("inputs", {}) or {}
+
         # 3) DB 조회
         with db() as conn, conn.cursor() as cur:
             ensure_runs(cur)
@@ -325,6 +393,10 @@ def lambda_handler(event, context):
             if not session_row:
                 return {"statusCode": 404, "headers": cors_headers(),
                         "body": json.dumps({"ok": False, "error": "session not found"})}
+
+            if session_row["user_id"] != user_id:
+                return {"statusCode": 403, "headers": cors_headers(),
+                        "body": json.dumps({"ok": False, "error": "user forbidden"})}
 
             doc_id = int(session_row["doc_id"])
 
@@ -359,23 +431,30 @@ def lambda_handler(event, context):
             stats=stats, anchors_sample=anchors_sample, chunk_snippets=chunk_snips
         )
 
-        # 4-1) 계획 저장 + 씨딩
-        persist_plan_and_seed_results(run_row["id"], plan_list)
+        # 4-1) 계획 저장 + 씨딩 (verifier 포함 정규화)
+        norm_plan = persist_plan_and_seed_results(run_row["id"], plan_list)
 
         # 5) 워커 호출
-        for worker in plan_list:
+        for worker in norm_plan:
+            if worker == "verifier":
+                continue
+
+            # extra_inputs + 기본 입력 merge
+            merged_inputs = dict(extra_inputs or {})
+            merged_inputs.update({
+                "s3TextKey": s3_key,
+                "role": role,
+                "question": question,
+                "focus": focus,
+            })
+
             try:
                 invoke_worker_async(worker, {
                     "runId": run_row["id"],
                     "sessionId": session_id,
                     "docId": doc_id,
                     "worker": worker,
-                    "inputs": {
-                        "s3TextKey": s3_key,
-                        "role": role,
-                        "question": question,
-                        "focus": focus,
-                    }
+                    "inputs": merged_inputs,
                 })
             except Exception as e:
                 log.warning(f"Worker invoke failed for {worker}: {e}")
@@ -383,7 +462,7 @@ def lambda_handler(event, context):
         # 5-1) 상태 재계산 트리거
         trigger_run_tick(run_row["id"])
 
-        # 6) 응답
+        # 6) 응답 (기존 그대로)
         resp = {
             "ok": True,
             "runId": run_row["id"],
@@ -400,7 +479,7 @@ def lambda_handler(event, context):
                 "startedAt": (run_row["started_at"].isoformat() + "Z") if run_row["started_at"] else None,
                 "finishedAt": (run_row["finished_at"].isoformat() + "Z") if run_row["finished_at"] else None,
             },
-            "plan": plan_list,
+            "plan": norm_plan,
             "doc": {
                 "id": doc_id,
                 "name": doc_name,
