@@ -1,11 +1,37 @@
 import os, json, logging, psycopg2
+import jwt
+from jwt import InvalidTokenError
+
+class AuthError(Exception):
+    pass
+
+def get_auth_user_id(event) -> int:
+    """
+    Authorization: Bearer <access_token> 헤더에서 user_id(sub) 추출
+    - 토큰 타입(type) == 'access' 체크
+    """
+    headers = (event.get("headers") or {})
+    auth = headers.get("Authorization") or headers.get("authorization") or ""
+    if not auth.startswith("Bearer "):
+        raise AuthError("missing bearer token")
+
+    token = auth.split(" ", 1)[1].strip()
+    try:
+        payload = jwt.decode(token, os.environ["JWT_SECRET_KEY"], algorithms=["HS256"])
+    except jwt.InvalidTokenError as e:
+        raise AuthError(f"invalid token: {e}")
+
+    if payload.get("type") != "access":
+        raise AuthError("invalid token type")
+
+    return int(payload["sub"])
 
 log = logging.getLogger(__name__)
 log.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
 
 # ---------- 공통 Response (CORS 포함) ----------
 def response(status: int, body: dict):
-    """統一 응답 헬퍼 - 모든 응답에 CORS 헤더 포함"""
+    """응답 헬퍼 - 모든 응답에 CORS 헤더 포함"""
     return {
         "statusCode": status,
         "headers": {
@@ -42,6 +68,11 @@ def get_predicted_role(cur, doc_id: int):
     row = cur.fetchone()
     return row[0] if row else None  # text[] or None
 
+def get_doc_owner(cur, doc_id: int):
+    cur.execute("SELECT user_id FROM documents WHERE id=%s;", (doc_id,))
+    r = cur.fetchone()
+    return r[0] if r else None
+
 def as_list(x):
     if isinstance(x, list):
         return x
@@ -56,6 +87,11 @@ def lambda_handler(event, context):
         if event.get("httpMethod", "").upper() == "OPTIONS":
             return response(200, {"ok": True, "message": "CORS preflight success"})
 
+        try:
+            user_id = get_auth_user_id(event)
+        except AuthError as e:
+            return response(401, {"ok": False, "error": str(e)})
+
         path = event.get("pathParameters") or {}
         doc_id_str = path.get("docId")
         if not doc_id_str:
@@ -64,6 +100,12 @@ def lambda_handler(event, context):
         doc_id = int(doc_id_str)
 
         with db() as conn, conn.cursor() as cur:
+            owner_id = get_doc_owner(cur, doc_id)
+            if owner_id is None:
+                return response(404, {"ok": False, "error": "document not found"})
+            if owner_id != user_id:
+                return response(403, {"ok": False, "error": "user forbidden"})
+
             predicted = get_predicted_role(cur, doc_id)
             predicted_role = as_list(predicted)
 

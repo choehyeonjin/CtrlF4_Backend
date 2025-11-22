@@ -1,5 +1,31 @@
 import os, json, logging, io, boto3, psycopg2
 from typing import Any, Dict
+import jwt
+from jwt import InvalidTokenError
+
+class AuthError(Exception):
+    pass
+
+def get_auth_user_id(event) -> int:
+    """
+    Authorization: Bearer <access_token> 헤더에서 user_id(sub) 추출
+    - 토큰 타입(type) == 'access' 체크
+    """
+    headers = (event.get("headers") or {})
+    auth = headers.get("Authorization") or headers.get("authorization") or ""
+    if not auth.startswith("Bearer "):
+        raise AuthError("missing bearer token")
+
+    token = auth.split(" ", 1)[1].strip()
+    try:
+        payload = jwt.decode(token, os.environ["JWT_SECRET_KEY"], algorithms=["HS256"])
+    except jwt.InvalidTokenError as e:
+        raise AuthError(f"invalid token: {e}")
+
+    if payload.get("type") != "access":
+        raise AuthError("invalid token type")
+
+    return int(payload["sub"])
 
 # Logging Setup
 logging.getLogger().setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
@@ -45,7 +71,7 @@ def db():
 # DB Operations
 def get_doc(cur, doc_id: int):
     cur.execute("""
-        SELECT id, name, status, pages, predicted_role, predicted_type
+        SELECT id, user_id, name, status, pages, predicted_role, predicted_type
         FROM documents WHERE id=%s;
     """, (doc_id,))
     return cur.fetchone()
@@ -53,13 +79,19 @@ def get_doc(cur, doc_id: int):
 def set_status(cur, doc_id: int, status: str, predicted_role=None, predicted_type=None, pages=None):
     cur.execute("""
         UPDATE documents SET
-            status=%s,
-            predicted_role = COALESCE(%s::text[], predicted_role),
-            predicted_type = COALESCE(%s, predicted_type),
-            pages          = COALESCE(%s, pages),
-            updated_at     = NOW()
-        WHERE id=%s;
-    """, (status, predicted_role, predicted_type, pages, doc_id))
+            status = %s,
+            predicted_role = COALESCE(predicted_role, %s::jsonb),
+            predicted_type = COALESCE(predicted_type, %s),
+            pages = COALESCE(%s, pages),
+            updated_at = NOW()
+        WHERE id = %s;
+    """, (
+        status,
+        json.dumps(predicted_role),  # Python list → JSON 문자열
+        predicted_type,
+        pages,
+        doc_id
+    ))
 
 def read_txt_head(bucket, key, n):
     obj = S3.get_object(Bucket=bucket, Key=key, Range=f"bytes=0-{n-1}")
@@ -98,6 +130,11 @@ def analyze(text: str) -> Dict[str, Any]:
 # Lambda Handler
 def lambda_handler(event, context):
     try:
+        try:
+            user_id = get_auth_user_id(event)
+        except AuthError as e:
+            return resp(401, {"ok": False, "error": str(e)})
+            
         # 1️⃣ Parse parameters
         path = event.get("pathParameters") or {}
         qsp = event.get("queryStringParameters") or {}
@@ -114,7 +151,9 @@ def lambda_handler(event, context):
             if not row:
                 return resp(404, {"ok": False, "error": "document not found"})
 
-            _, name, status, pages_in_db, existed_roles, existed_type = row
+            _, owner_id, name, status, pages_in_db, existed_roles, existed_type = row
+            if owner_id != user_id:
+                return resp(403, {"ok": False, "error": "forbidden"})
 
             if not force and (
                 (existed_roles and len(existed_roles) > 0)

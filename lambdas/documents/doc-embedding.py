@@ -3,6 +3,32 @@ from typing import List, Dict, Any, Tuple
 import boto3, psycopg2
 from psycopg2.extras import execute_values
 from datetime import datetime, timezone
+import jwt
+from jwt import InvalidTokenError
+
+class AuthError(Exception):
+    pass
+
+def get_auth_user_id(event) -> int:
+    """
+    Authorization: Bearer <access_token> 헤더에서 user_id(sub) 추출
+    - 토큰 타입(type) == 'access' 체크
+    """
+    headers = (event.get("headers") or {})
+    auth = headers.get("Authorization") or headers.get("authorization") or ""
+    if not auth.startswith("Bearer "):
+        raise AuthError("missing bearer token")
+
+    token = auth.split(" ", 1)[1].strip()
+    try:
+        payload = jwt.decode(token, os.environ["JWT_SECRET_KEY"], algorithms=["HS256"])
+    except jwt.InvalidTokenError as e:
+        raise AuthError(f"invalid token: {e}")
+
+    if payload.get("type") != "access":
+        raise AuthError("invalid token type")
+
+    return int(payload["sub"])
 
 logging.getLogger().setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
 log = logging.getLogger(__name__)
@@ -42,8 +68,8 @@ def db():
     return psycopg2.connect(
         host=need("PGHOST"),
         port=int(os.getenv("PGPORT", "5432")),
-        dbname=need("PGDATABASE"),
-        user=need("PGUSER"),
+        dbname=os.getenv("PGDATABASE", "ctrlf4"),
+        user=os.getenv("PGUSER", "ctrlf4"),
         password=need("PGPASSWORD"),
         sslmode="require",
         connect_timeout=5
@@ -343,11 +369,23 @@ def upsert_chunks(cur, doc_id: int, chunks, embs, meta, A):
     """
     execute_values(cur, sql, rows, template="(%s,%s,%s,%s::vector,%s::jsonb,%s::jsonb)")
 
+def get_doc_owner_and_name(cur, doc_id: int):
+    cur.execute("SELECT user_id, name FROM documents WHERE id=%s;", (doc_id,))
+    r = cur.fetchone()
+    if not r:
+        return None, None
+    return r[0], r[1]
+
 # --------- Handler ----------
 def lambda_handler(event, context):
     try:
         if event.get("httpMethod", "").upper() == "OPTIONS":
             return response(200, {"ok": True, "message": "CORS preflight success"})
+
+        try:
+            user_id = get_auth_user_id(event)
+        except AuthError as e:
+            return response(401, {"ok": False, "error": str(e)})
 
         path = event.get("pathParameters") or {}
         qsp = event.get("queryStringParameters") or {}
@@ -375,9 +413,12 @@ def lambda_handler(event, context):
 
         # 임베딩 수행
         with db() as conn, conn.cursor() as cur:
-            name = get_doc_name(cur, doc_id)
+            owner_id, name = get_doc_owner_and_name(cur, doc_id)
             if not name:
                 return response(404, {"ok": False, "error": "document not found"})
+            if owner_id != user_id:
+                return response(403, {"ok": False, "error": "forbidden"})
+                
             if has_chunks(cur, doc_id) and not force:
                 return response(200, {
                     "ok": True, "skipped": True, "reason": "chunks_exist",

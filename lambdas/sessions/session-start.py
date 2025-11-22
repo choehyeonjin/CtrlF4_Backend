@@ -1,4 +1,30 @@
 import os, json, logging, psycopg2
+import jwt
+from jwt import InvalidTokenError
+
+class AuthError(Exception):
+    pass
+
+def get_auth_user_id(event) -> int:
+    """
+    Authorization: Bearer <access_token> 헤더에서 user_id(sub) 추출
+    - 토큰 타입(type) == 'access' 체크
+    """
+    headers = (event.get("headers") or {})
+    auth = headers.get("Authorization") or headers.get("authorization") or ""
+    if not auth.startswith("Bearer "):
+        raise AuthError("missing bearer token")
+
+    token = auth.split(" ", 1)[1].strip()
+    try:
+        payload = jwt.decode(token, os.environ["JWT_SECRET_KEY"], algorithms=["HS256"])
+    except jwt.InvalidTokenError as e:
+        raise AuthError(f"invalid token: {e}")
+
+    if payload.get("type") != "access":
+        raise AuthError("invalid token type")
+
+    return int(payload["sub"])
 
 log = logging.getLogger(__name__)
 log.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
@@ -117,6 +143,15 @@ def lambda_handler(event, context):
         return {"statusCode": 200, "headers": cors_headers()}
 
     try:
+        try:
+            user_id = get_auth_user_id(event)
+        except AuthError as e:
+            return {
+                "statusCode": 401,
+                "headers": cors_headers(),
+                "body": json.dumps({"ok": False, "error": str(e)})
+            }
+            
         body = parse_body(event)
         doc_id = body.get("docId")
         role   = (body.get("role") or "").strip()[:64]
@@ -139,19 +174,27 @@ def lambda_handler(event, context):
         with db() as conn, conn.cursor() as cur:
             ensure_sessions_schema(cur)
 
-            cur.execute("SELECT 1 FROM documents WHERE id=%s;", (doc_id,))
-            if cur.fetchone() is None:
+            cur.execute("SELECT user_id FROM documents WHERE id=%s;", (doc_id,))
+            row = cur.fetchone()
+            if row is None:
                 return {
                     "statusCode": 404,
                     "headers": cors_headers(),
                     "body": json.dumps({"ok": False, "error": "document not found"})
                 }
 
+            if row[0] != user_id:
+                return {
+                    "statusCode": 403,
+                    "headers": cors_headers(),
+                    "body": json.dumps({"ok": False, "error": "user forbidden"})
+                }
+
             cur.execute("""
               INSERT INTO sessions (user_id, doc_id, role, answers)
-              VALUES (NULL, %s, %s, %s::json)
+              VALUES (%s, %s, %s, %s::json)
               RETURNING id;
-            """, (doc_id, role, json.dumps(answers)))
+            """, (user_id, doc_id, role, json.dumps(answers)))
             sid = cur.fetchone()[0]
             conn.commit()
 
@@ -168,7 +211,7 @@ def lambda_handler(event, context):
         }
 
     except Exception as e:
-        log.exception("sessions-create failed")
+        log.exception("sessions-start failed")
         return {
             "statusCode": 500,
             "headers": cors_headers(),
