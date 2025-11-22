@@ -1,9 +1,13 @@
 import os, json, logging, datetime
 from typing import Dict, Any, List, Tuple
 import psycopg2
+import boto3
 
 log = logging.getLogger(__name__)
 log.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
+AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
+L_VERIFY   = os.getenv("L_VERIFY")
+_lambda    = boto3.client("lambda", region_name=AWS_REGION)
 
 # DB
 def db():
@@ -17,20 +21,46 @@ def db():
         connect_timeout=5,
     )
 
+def _trigger_verify(run_id: int):
+    """
+    verifier agent(run-verify)를 비동기로 호출
+    """
+    if not L_VERIFY:
+        log.warning("L_VERIFY not set; skip auto verifier invoke")
+        return
+    try:
+        _lambda.invoke(
+            FunctionName=L_VERIFY,
+            InvocationType="Event",
+            Payload=json.dumps({"runId": run_id}).encode("utf-8"),
+        )
+        log.info(f"[run-tick] auto-trigger verifier for run {run_id}")
+    except Exception as e:
+        log.warning(f"[run-tick] auto-trigger verifier failed: {e}")
+
+
 # 핵심 로직: 1개 run 재계산 및 반영
 def recompute_and_update_run(run_id: int) -> Dict[str, Any]:
     """
     run_results 상태 기반으로 runs.status/progress/finished_at 갱신
     - 분모: runs.plan JSONB (없으면 run_results의 key들 사용)
     - 분자: run_results.payload.status (done/failed/running/queued)
-    - 정책: 모든 워커 done이면 runs.status = 'completed'
+    - 정책:
+      * 모든 워커 done + verifier.pass → runs.status = 'completed'
+      * verifier.retry/실패 → runs.status = 'failed' (또는 FE에서 별도 처리)
     """
     with db() as conn, conn.cursor() as cur:
-        cur.execute("SELECT plan, status, finished_at FROM runs WHERE id=%s", (run_id,))
+        # 여기서 한 번에 attempt까지 같이 읽음
+        cur.execute(
+            "SELECT plan, status, finished_at, attempt FROM runs WHERE id=%s",
+            (run_id,),
+        )
         row = cur.fetchone()
         if not row:
+            log.warning(f"[run-tick] run not found: {run_id}")
             return {"ok": False, "error": f"run not found: {run_id}"}
-        plan_json, current_status, finished_at = row
+
+        plan_json, current_status, finished_at, attempt = row
 
         # 1) 계획(분모) 및 현재 결과들 수집
         plan = plan_json or []
@@ -42,11 +72,26 @@ def recompute_and_update_run(run_id: int) -> Dict[str, Any]:
             payload = p if isinstance(p, dict) else (json.loads(p) if isinstance(p, str) else {})
             status_map[w] = payload
 
-        # __plan__ 같은 예약 키 제외
+        # 🔍 run_results 전체 요약 로그
+        log.info(f"[run-tick] #{run_id} status_map_keys={list(status_map.keys())}")
+
+        # ── 분모(workers) 구성 ─────────────────────
         workers: List[str] = list(plan) if plan else [w for w in status_map.keys() if w != "__plan__"]
+
+        # run_results에만 존재하는 verifier도 workers에 포함
+        if "verifier" in status_map and "verifier" not in workers:
+            workers.append("verifier")
+
         total = len(workers)
         if total == 0:
+            log.warning(f"[run-tick] #{run_id} no workers found (plan & run_results empty)")
             return {"ok": False, "error": f"no workers found for run_id={run_id}"}
+
+        # 🔍 워커별 상태 로그
+        log.info(f"[run-tick] #{run_id} workers={workers}")
+        for w in workers:
+            st = (status_map.get(w, {}) or {}).get("status", "queued")
+            log.info(f"[run-tick] #{run_id}  - {w}: {st}")
 
         # 2) 상태 집계
         done = 0
@@ -64,40 +109,121 @@ def recompute_and_update_run(run_id: int) -> Dict[str, Any]:
         progress = int(round(100 * done / max(1, total)))
         progress = min(max(progress, 0), 100)
 
+        # ── verifier 자동 실행 트리거 ─────────────────
+        core_workers = [w for w in workers if w != "verifier"]
+        all_core_done = all(
+            (status_map.get(w, {}) or {}).get("status", "queued") == "done"
+            for w in core_workers
+        ) if core_workers else False
+
+        v_payload = (status_map.get("verifier") or {})
+        v_status = v_payload.get("status", "queued")
+
+        log.info(
+            f"[run-tick] #{run_id} core_workers={core_workers}, "
+            f"all_core_done={all_core_done}, any_failed={any_failed}"
+        )
+        if "verifier" in workers:
+            log.info(
+                f"[run-tick] #{run_id} verifier-status={v_status}, "
+                f"verdict={v_payload.get('verdict')}"
+            )
+
+        # 코어 워커들은 다 끝났고, 실패는 없고, verifier는 아직 안 돌았으면 → 자동 실행
+        if (
+            "verifier" in workers
+            and all_core_done
+            and not any_failed
+            and v_status in ("queued", "waiting")
+        ):
+            log.info(f"[run-tick] #{run_id} verifier auto-run condition MET → trigger")
+            _trigger_verify(run_id)
+        else:
+            log.info(
+                f"[run-tick] #{run_id} verifier auto-run condition NOT met "
+                f"(has_verifier={'verifier' in workers}, all_core_done={all_core_done}, "
+                f"any_failed={any_failed}, v_status={v_status})"
+            )
+
         # 3) 상태 결정
+        set_finished_now = False
+
         if any_failed:
             new_status = "failed"
             set_finished_now = True
-        elif total > 0 and done == total:
-            # 모두 성공 → completed
-            new_status = "completed"
-            set_finished_now = True
-        elif any_running:
-            new_status = "running"
-            set_finished_now = False
+
+        elif "verifier" in workers:
+            # verifier 있는 경우: verdict에 따라 최종 상태 결정
+            v_payload = (status_map.get("verifier") or {})
+            v_status = v_payload.get("status", "queued")
+            verdict  = v_payload.get("verdict")  # pass / retry / retry_limit / None ... 
+
+            log.info(
+                f"[run-tick] #{run_id} verifier final check: "
+                f"v_status={v_status}, verdict={verdict}, done={done}, total={total}"
+            )
+
+            if done == total and v_status == "done":
+                # 모든 워커 포함 verifier까지 done
+                if verdict in (None, "pass"):
+                    new_status = "completed"
+                    set_finished_now = True
+                elif verdict in ("retry", "retry_limit", "fail"):
+                    new_status = "failed"
+                    set_finished_now = True
+                else:
+                    new_status = "failed"
+                    set_finished_now = True
+            else:
+                # 아직 verifier가 running/queued 상태
+                if any_running or done > 0:
+                    new_status = "running"
+                else:
+                    new_status = "queued"
+                set_finished_now = False
+
         else:
-            new_status = "queued"
-            set_finished_now = False
+            # verifier 없는 기존 케이스
+            if total > 0 and done == total:
+                new_status = "completed"
+                set_finished_now = True
+            elif any_running:
+                new_status = "running"
+                set_finished_now = False
+            else:
+                new_status = "queued"
+                set_finished_now = False
 
         # 4) DB 반영
+        log.info(
+            f"[run-tick] #{run_id} FINAL new_status={new_status}, "
+            f"progress={progress}, set_finished_now={set_finished_now}"
+        )
+
         if set_finished_now and finished_at is None:
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE runs
                    SET status=%s,
                        progress=%s,
                        finished_at=NOW()
                  WHERE id=%s
-            """, (new_status, progress, run_id))
+                """,
+                (new_status, progress, run_id),
+            )
         else:
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE runs
                    SET status=%s,
                        progress=%s
                  WHERE id=%s
-            """, (new_status, progress, run_id))
+                """,
+                (new_status, progress, run_id),
+            )
         conn.commit()
 
-        log.info(f"[run-tick] run {run_id} → {new_status} ({done}/{total}, {progress}%)")
+        log.info(f"[run-tick] #{run_id} → {new_status} ({done}/{total}, {progress}%)")
 
         return {
             "ok": True,
