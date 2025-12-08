@@ -14,7 +14,7 @@ AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
 
 # ==== Gemini ====
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 
@@ -219,7 +219,7 @@ def make_prompt_for_revision(
         metrics = retry_info.get("metrics") or {}
         attempt = retry_info.get("attempt")
         vf_block = f"""
-[검증(Verifier) 피드백]
+[검증(Verifier) 피드백)]
 - attempt: {attempt}
 - reason: {reason or "N/A"}
 - metrics: anchorRate={metrics.get("anchorRate")}, kpri={metrics.get("kpri")}, faithfulness={metrics.get("faithfulness")}
@@ -243,6 +243,37 @@ def make_prompt_for_revision(
 너는 한국어 계약/약관 편집 전문가인 **Revision Agent**다.
 목표는 문서 속 위험·불균형·장황·오탈자를 찾아서, **실제 계약서에 바로 넣을 수 있는 수정 문안**을 만들어 주는 것이다.
 
+[중요 원칙: QA와 Revision 분리]
+
+- 사용자의 question 안에는 다음이 섞여 있을 수 있다:
+  - "오탈자/위험 조항 수정해주고", "문구를 다듬어줘", "대체 표현을 제안해줘" 와 같은 **문장/표현 수정 요청**
+  - 그 이외의 **문서 내용에 대한 정보 질의(질문)**
+
+- 이 작업에서 너는 **QA Agent가 아니다.**
+  - "어떻게 처리되는가?", "어떤 의미인가?", "알려줘", "무엇인가?" 등 정보 질의에 **직접 답변하지 말고**,
+  - 그 질문이 드러내는 **관심사/우려(예: 계약 종료 시 기밀정보 처리에 대한 우려)**만 참고하여라.
+
+- 예시:
+  - question: "오탈자 수정해주고, 계약 종료 시 기밀정보는 어떻게 처리해야 하는가?"
+    - 잘못된 행동: "계약 종료 시 기밀정보는 문서에 규정되어 있지 않습니다." 와 같이 QA 답변을 하는 것.
+    - 올바른 행동: 
+      - 계약서 내 오탈자·표현만을 고친다.
+
+즉, question/focus는
+- “어떤 관점에서 고쳐야 하는지”(우려/관심사),
+- “어떤 조항을 보완하고 싶은지”를 나타내는 힌트로만 사용하고,
+문서에 무엇이 쓰여 있는지 설명하거나, 질문에 대한 답을 문단으로 쓰지 마라.
+
+[최소 수정 개수 규칙 – 중요]
+
+- 문서에 큰 위험이 없다고 판단되더라도,
+  - question 또는 focus 안에 "오탈자", "오타", "수정", "고쳐", "바꿔", "대체", "문구", "표현", "템플릿" 등의
+    **수정 관련 키워드가 하나라도 포함되어 있다면**,  
+    → 반드시 **revisions 항목을 최소 1개 이상 생성**하라.
+- 이 경우 위험(risk)이 크지 않다면,
+  - issues.risk 는 빈 문자열로 두고,
+  - issues.length / issues.typo 중심으로 **스타일/오탈자/가독성 개선용 제안**만 작성해도 된다.
+
 [작업 범위]
 
 1) **위험/불균형 조항 수정**
@@ -264,7 +295,9 @@ def make_prompt_for_revision(
 3) **사용자 맥락 반영 (role / question / focus)**
    - role, question, focus가 있으면, 그 관점에서 특히 신경 쓰이는 부분을 우선적으로 다루고,
      이에 맞는 **맞춤형 수정 문구**를 함께 제안하라.
-   - 예: “법무팀 검토용”, “세입자 보호 관점”, “위약금 줄이기” 등.
+   - 단, question 안의 **정보 질의 문장**은
+     - "어떻게 처리해야 하는가?", "무엇인지 알려줘" 같은 형태의 QA 질문으로 보며,
+     - 그 자체에 답변하지 말아라.
 
 [사용자 맥락]
 - role: {role or "(미지정)"}
