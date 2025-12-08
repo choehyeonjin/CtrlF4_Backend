@@ -18,9 +18,9 @@ WORKER_LAMBDA_MAP = {
 }
 
 MAX_ATTEMPT = 2
-ANCHOR_RATE_THRESHOLD = 0.4
-KPRI_THRESHOLD = 0.3
-FAITHFULNESS_THRESHOLD = 0.5
+ANCHOR_RATE_THRESHOLD = 0.50 # 앵커 포함율
+KPRI_THRESHOLD          = 0.50 # QA <-> Summarizer가 앵커 제대로 썼는지 일관성
+FAITHFULNESS_THRESHOLD  = 0.50 # 요약 내용이 어느 정도만 맞는지
 
 ########## DB ##########
 def db():
@@ -74,59 +74,316 @@ def get_run_and_results(cur, run_id: int):
 # 1) Deterministic Metric 계산 로직      #
 ##########################################
 
+def _collect_summarizer_anchors(sm: dict):
+    """
+    summarizer 결과에서 앵커/조항 정보를 모아오는 헬퍼
+    - anchor_ids: by_clause[*].anchors[*].id / anchor_id
+    - clause_titles: by_clause[*].title + anchors[*].title
+    - clause_ids: by_clause[*].clause_id
+    - by_clause: 원본 리스트
+    """
+    sm_res = (sm or {}).get("results") or {}
+    by_clause = sm_res.get("by_clause") or []
+
+    # 혹시 dict 로 올 수도 있으니 방어
+    if isinstance(by_clause, dict):
+        by_clause = list(by_clause.values())
+
+    anchor_ids: set[str] = set()
+    clause_titles: set[str] = set()
+    clause_ids: set[str] = set()
+
+    for c in by_clause:
+        if not isinstance(c, dict):
+            continue
+
+        t = c.get("title")
+        if t:
+            clause_titles.add(str(t).strip())
+
+        cid = c.get("clause_id")
+        if cid:
+            clause_ids.add(str(cid).strip())
+
+        for a in c.get("anchors") or []:
+            if not isinstance(a, dict):
+                continue
+            aid = a.get("id") or a.get("anchor_id")
+            if aid:
+                anchor_ids.add(str(aid).strip())
+            atitle = a.get("title")
+            if atitle:
+                clause_titles.add(str(atitle).strip())
+
+    return anchor_ids, clause_titles, clause_ids, by_clause
+
+
 def calc_anchor_rate(results: dict) -> float:
     """
-    summarizer, risk, qa 결과에서 anchor 매칭 비율 계산
+    anchorRate: 각 워커 결과 당 '앵커가 있는지' 존재 여부만 파악하는 구조적 지표.
+      - summarizer: by_clause[*].anchors 에 앵커가 하나라도 있으면 OK
+      - risk: items[*].anchor.id / title 이 하나라도 있으면 OK
+      - qa: anchors 배열이 비어있지 않으면 OK
+      - revision: revisions[*].anchor.id / title 이 하나라도 있으면 OK
+
+    anchorRate = (앵커가 있는 워커 수) / (결과가 존재하는 워커 수)
     """
     try:
-        sm = results.get("summarizer", {})
-        clauses = sm.get("results", {}).get("by_clause", {})
-        summarizer_clause_cnt = len(clauses)
+        present_workers = 0
+        workers_with_anchor = 0
 
-        rk = results.get("risk", {})
-        risk_items = rk.get("items", [])
-        risk_anchors = [r.get("id") for r in risk_items if r.get("id")]
+        # summarizer
+        sm = results.get("summarizer")
+        if sm is not None:
+            present_workers += 1
+            _, _, _, by_clause = _collect_summarizer_anchors(sm)
+            has_anchor = False
+            for c in by_clause:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("anchors"):
+                    has_anchor = True
+                    break
+            if has_anchor:
+                workers_with_anchor += 1
 
-        if summarizer_clause_cnt == 0:
+        # risk
+        rk = results.get("risk")
+        if rk is not None:
+            present_workers += 1
+            items = rk.get("items") or []
+            has_anchor = False
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                a = it.get("anchor") or {}
+                if a.get("id") or a.get("title"):
+                    has_anchor = True
+                    break
+            if has_anchor:
+                workers_with_anchor += 1
+
+        # qa
+        qa = results.get("qa")
+        if qa is not None:
+            present_workers += 1
+            anchors = qa.get("anchors") or []
+            if anchors:
+                workers_with_anchor += 1
+
+        # revision
+        rv = results.get("revision")
+        if rv is not None:
+            present_workers += 1
+            revs = rv.get("revisions") or []
+            has_anchor = False
+            for r in revs:
+                if not isinstance(r, dict):
+                    continue
+                a = r.get("anchor") or {}
+                if a.get("id") or a.get("title"):
+                    has_anchor = True
+                    break
+            if has_anchor:
+                workers_with_anchor += 1
+
+        if present_workers == 0:
+            # 아무 결과도 없으면 이 지표로 판단 불가 → 중립적으로 1.0
             return 1.0
 
-        rate = len(risk_anchors) / summarizer_clause_cnt
+        rate = workers_with_anchor / present_workers
         return round(max(0.0, min(rate, 1.0)), 4)
+
     except Exception as e:
         log.warning(f"anchorRate calc fail: {e}")
         return 0.5
 
 def calc_kpri(results: dict) -> float:
     """
-    QA 답변의 근거 anchoring 존재 여부를 기반으로 계산
+    kpri(완화 기준):
+      QA에서 인용한 anchor 문자열들이
+      summarizer의 (title / clause_id / anchor.id / anchor.title) 중
+      하나라도 '의미적으로 매칭'되는 비율.
+
+    완화된 매칭 규칙:
+      - 완전 일치
+      - summarizer title/anchor title이 QA anchor로 시작(startswith)
+      - QA anchor가 summarizer title 내부에 포함(substring)
+      - 숫자 기반 id 매칭 (예: "제6조" ↔ clause_id "art-6" 일부 일치)
     """
     try:
-        qa = results.get("qa", {})
-        anchors = qa.get("anchors", [])
-        if not anchors:
-            return 0.3
-        return round(min(1.0, len(anchors) / 4), 4)
+        qa = results.get("qa") or {}
+        qa_anchors = qa.get("anchors") or []
+        if not qa_anchors:
+            return 0.1
+
+        sm = results.get("summarizer") or {}
+        anchor_ids, clause_titles, clause_ids, _ = _collect_summarizer_anchors(sm)
+
+        # 비교 대상 정규화
+        summ_all = set()
+        for t in clause_titles:
+            summ_all.add(str(t).strip())
+        for cid in clause_ids:
+            summ_all.add(str(cid).strip())
+        for aid in anchor_ids:
+            summ_all.add(str(aid).strip())
+
+        if not summ_all:
+            return round(min(1.0, len(qa_anchors) / 4), 4)
+
+        def normalize(s: str) -> str:
+            # 공백/특수기호 정리
+            import re
+            return re.sub(r"\s+", " ", s).strip()
+
+        # 매칭 함수 (완화 버전)
+        def is_match(qa_anchor: str, summ_val: str) -> bool:
+            qa_norm = normalize(qa_anchor)
+            sv_norm = normalize(summ_val)
+
+            # 1) 완전 일치
+            if qa_norm == sv_norm:
+                return True
+
+            # 2) 시작 부분 매칭
+            #   "특약사항 1" → "특약사항 1. 임대인의 조기해지권"
+            if sv_norm.startswith(qa_norm):
+                return True
+
+            # 3) substring 매칭
+            if qa_norm in sv_norm:
+                return True
+
+            # 4) 숫자 기반 일치 (제6조 ↔ art-6 / 6 포함)
+            import re
+            qa_nums = re.findall(r"\d+", qa_norm)
+            sv_nums = re.findall(r"\d+", sv_norm)
+            if qa_nums and sv_nums:
+                # 공통 숫자 하나라도 있으면 인정
+                if any(n in sv_nums for n in qa_nums):
+                    return True
+
+            return False
+
+        # 매칭 개수 세기
+        match = 0
+        for raw in qa_anchors:
+            s = str(raw).strip()
+            if any(is_match(s, summ_val) for summ_val in summ_all):
+                match += 1
+
+        ratio = match / len(qa_anchors)
+        return round(max(0.0, min(ratio, 1.0)), 4)
+
     except Exception as e:
         log.warning(f"kpri calc fail: {e}")
         return 0.3
 
+import re
+
+TOP_TITLE_RE = re.compile(r"^제\s*\d+\s*조")
+
+def _is_top_clause(c: dict) -> bool:
+    """상위 '제n조' 레벨만 faithfulness 평가 대상으로 사용"""
+    title = (c.get("title") or "").strip()
+    if TOP_TITLE_RE.search(title):
+        return True
+
+    # anchors 에 level == 1 이 있으면 상위 조로 간주
+    for a in c.get("anchors") or []:
+        if isinstance(a, dict) and a.get("level") == 1:
+            return True
+    return False
+
+
 def calc_faithfulness(results: dict) -> float:
     """
-    summarizer summary와 원문 anchor overlap 기반 계산 (간이)
-    """
-    try:
-        sm = results.get("summarizer", {})
-        full = sm.get("results", {}).get("full_document", {}).get("summary", "")
-        if not full:
-            return 0.3
+    faithfulness (요약 충실도, summarizer 전용):
 
-        if len(full) > 500:
-            return 0.85
-        return 0.70
+    - summarizer 의 by_clause 중 '제n조 ...' 같은 상위 조만 대상으로 삼고,
+      각 조 요약이 제목/앵커와 어느 정도 맞는지 대략 평가한다.
+
+    - 기준 완화:
+      * 항/호(1., 2., 25. 같은 숫자 title)는 아예 평가 대상에서 제외
+      * summary 길이 기준 완화 (30자 이상)
+      * raw_rate 를 0.3 ~ 1.0 구간으로 소프트 스케일링
+    """
+
+    try:
+        sm = results.get("summarizer") or {}
+        sm_res = (sm.get("results") or {})
+        by_clause = sm_res.get("by_clause") or []
+
+        if isinstance(by_clause, dict):
+            by_clause = list(by_clause.values())
+
+        total = 0
+        faithful = 0
+
+        for c in by_clause:
+            if not isinstance(c, dict):
+                continue
+
+            # 상위 조(제n조 …)만 평가
+            if not _is_top_clause(c):
+                continue
+
+            summary = (c.get("summary") or "").strip()
+            if not summary:
+                continue
+
+            total += 1
+
+            # 너무 짧은 요약은 정보량이 부족하다고 보고 패스
+            if len(summary) < 30:
+                continue
+
+            title = (c.get("title") or "").strip()
+            anchor_titles = []
+            for a in c.get("anchors") or []:
+                if isinstance(a, dict):
+                    t = (a.get("title") or "").strip()
+                    if t:
+                        anchor_titles.append(t)
+
+            text_for_keywords = " ".join([title] + anchor_titles)
+
+            cleaned = re.sub(r"[^0-9A-Za-z가-힣\s]", " ", text_for_keywords)
+            tokens = [
+                t for t in cleaned.split()
+                if len(t) >= 2 and t not in ["제", "조", "항", "특약사항"]
+            ]
+
+            is_faithful = False
+            for tok in tokens:
+                if tok and tok in summary:
+                    is_faithful = True
+                    break
+
+            if is_faithful:
+                faithful += 1
+
+        if total == 0:
+            # 조 단위 요약이 없으면 full_document 길이 기반 fallback (조금 후하게)
+            full = (sm_res.get("full_document") or {}).get("summary") or ""
+            if not full:
+                return 0.4
+            if len(full) > 500:
+                return 0.9
+            return 0.75
+
+        raw_rate = faithful / total
+
+        # 너무 극단적으로 낮게 나오지 않도록 스케일링
+        # raw_rate=0 → 0.3 / raw_rate=1 → 1.0
+        score = 0.3 + 0.7 * raw_rate
+        return round(max(0.0, min(score, 1.0)), 4)
+
     except Exception as e:
         log.warning(f"faithfulness calc fail: {e}")
-        return 0.5
-
+        # 에러 시 살짝 보수적인 중간값
+        return 0.6
 
 ##########################################
 # 2) LLM 기반 Expert 검증 (Meta-verdict) #
@@ -173,14 +430,28 @@ metrics:
 - kpri: 키포인트 관련성 지표
 - faithfulness: 요약 충실도 지표
 
-metricFlags:
-- anchorRateLow: anchorRate < 기준값 인지 여부
-- kpriLow: kpri < 기준값 인지 여부
-- faithfulnessLow: faithfulness < 기준값 인지 여부
+    metricFlags:
+    - anchorRateLow: anchorRate < 기준값 인지 여부
+    - kpriLow: kpri < 기준값 인지 여부
+    - faithfulnessLow: faithfulness < 기준값 인지 여부
 
-suggestedRetryWorkers:
-- 지표 기준에 따라 코드에서 추천한 retry 후보 워커 목록이다.
-- 이 중에서 진짜 retry가 필요한 worker만 골라라.
+    thresholds:
+    - 각 지표별 기준값 (anchorRate, kpri, faithfulness)
+
+    suggestedRetryWorkers:
+    - 지표 기준에 따라 코드에서 추천한 retry 후보 워커 목록이다.
+      * anchorRateLow 가 true 이면 보통 ["summarizer", "risk"] 가 포함된다.
+      * kpriLow 가 true 이면 보통 ["qa"] 가 포함된다.
+      * faithfulnessLow 가 true 이면 보통 ["summarizer"] 가 포함된다.
+      이 중에서 진짜 retry가 필요한 worker만 골라라.
+
+    추가 규칙:
+    - metricFlags 가 모두 false 이면 기본적으로 verdict 는 "pass" 로 하라
+      (JSON에서 아주 명백한 오류/누락을 발견한 경우가 아니라면 retry를 선택하지 말 것).
+    - metricFlags 중 true 인 것이 1개뿐이고, 해당 지표 값이 threshold에서 0.1 이내라면
+      가급적 "pass" 를 선택하라.
+    - 두 개 이상의 metricFlags 가 true 이거나,
+      특정 지표 값이 0.1 미만으로 매우 낮을 때만 "retry" 를 선택하라.
 
 가능한 worker 이름(반드시 이 중에서만 사용):
 - "summarizer", "risk", "qa", "revision"
@@ -266,7 +537,7 @@ def auto_retry(cur, run: dict, metrics: dict, vout: dict):
     new_attempt_row = cur.fetchone()
     new_attempt = new_attempt_row[0] if new_attempt_row else (run.get("attempt", 0) + 1)
 
-    # ✅ 기존 구조 유지 + 필드만 추가
+    # 기존 구조 유지 + 필드만 추가
     retry_info = {
         "from": "verifier",
         "attempt": new_attempt,
@@ -348,7 +619,22 @@ def lambda_handler(event, context):
                 "faithfulnessLow": faith < FAITHFULNESS_THRESHOLD
             }
 
-            log.info(f"[verifier] metrics: {metrics}, flags: {metric_flags}")
+            # NEW: 지표 기준으로 코드 레벨 추천 retry 후보
+            suggested_retry_workers = set()
+            if metric_flags["anchorRateLow"]:
+                suggested_retry_workers.update(["summarizer", "risk"])
+            if metric_flags["kpriLow"]:
+                suggested_retry_workers.add("qa")
+            if metric_flags["faithfulnessLow"]:
+                suggested_retry_workers.add("summarizer")
+
+            thresholds = {
+                "anchorRate": ANCHOR_RATE_THRESHOLD,
+                "kpri": KPRI_THRESHOLD,
+                "faithfulness": FAITHFULNESS_THRESHOLD,
+            }
+
+            log.info(f"[verifier] metrics: {metrics}, flags: {metric_flags}, suggestedRetryWorkers={list(suggested_retry_workers)}")
 
             # 2) LLM에 worker_results + metrics 함께 전달
             plan_workers = run["plan"] or []
@@ -360,7 +646,9 @@ def lambda_handler(event, context):
             merged = {
                 "workers": worker_results,
                 "metrics": metrics,
-                "metricFlags": metric_flags, # [추가] LLM에게 기준 통과 여부를 명시적으로 전달
+                "metricFlags": metric_flags,
+                "thresholds": thresholds,
+                "suggestedRetryWorkers": list(suggested_retry_workers),
                 "attempt": run.get("attempt", 0),
             }
 
