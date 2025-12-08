@@ -169,18 +169,33 @@ import google.generativeai as genai
 def get_plan_from_gemini(role: str, question: str, focus_list, stats: dict,
                          anchors_sample: list[str], chunk_snippets: list[str]):
     """
-    문서 메타데이터를 기반으로 어떤 워커(summarizer, risk, qa, revision)를 실행할지 Gemini로 판단
+    문서 메타데이터를 기반으로 어떤 워커(summarizer, risk, qa, revision)를 실행할지 판단.
+    - 최소 기준은 아래 규칙을 항상 만족시키도록 강제한다.
+
+      1) summarizer : 항상 실행
+      2) risk       : 항상 실행
+      3) qa         : question 과 focus 가 둘 다 비어있지 않을 때만 실행
+      4) revision   : 아래 둘 중 하나라도 만족하면 실행
+         - role 에 '작성/수정/검토/법무/리스크/컴플라이언스' 등 작성·검토 역할이 포함
+         - question 텍스트에 '수정/수정안/고쳐/바꿔/대체/다듬/문구 제안/템플릿/다른 표현' 등
+           수정·대체 표현을 요구하는 키워드가 포함
+         - focus 는 revision 실행 여부에 영향을 주지 않음
     """
+    # focus_list 정규화
+    if isinstance(focus_list, str):
+        focus_list = [focus_list]
+    focus_list = focus_list or []
+
+    model_plan = None
+
     try:
+        # ── 1) Gemini 호출 (참고용) ─────────────────────────
         genai.configure(api_key=need("GEMINI_API_KEY"))
         model = genai.GenerativeModel(os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite"))
 
         anchors_lines  = "\n".join(f"- {t}" for t in anchors_sample[:10]) or "- (없음)"
         snippets_lines = "\n".join(f"- {s}" for s in chunk_snippets[:10]) or "- (없음)"
-
-        if isinstance(focus_list, str):
-            focus_list = [focus_list]
-        focus_str = ", ".join(focus_list or [])
+        focus_str = ", ".join(focus_list) or "(없음)"
 
         prompt = f"""
 너는 계약서 분석을 담당하는 오케스트레이터 AI다.
@@ -189,14 +204,14 @@ def get_plan_from_gemini(role: str, question: str, focus_list, stats: dict,
 
 가능한 워커들은 다음 네 가지이다: 
 1. "summarizer" : 문서 전체 및 조항별 요약 
-2. "risk" : 6대 핵심 리스크 탐지 (법률·환불·개인정보·변경·책임·라이선스) 
-3. "qa" : 사용자의 질문(question, focus)에 대한 질의응답 
-4. "revision" : 탐지된 리스크 조항에 대한 수정·대체 문안 제안
+2. "risk"       : 6대 핵심 리스크 탐지 (법률·환불·개인정보·변경·책임·라이선스) 
+3. "qa"         : 사용자의 질문(question, focus)에 대한 질의응답 
+4. "revision"   : 탐지된 리스크 조항에 대한 수정·대체 문안 제안
 
 ### 입력 정보
 - 역할(role): {role or "(없음)"}
 - 사용자 질문(question): {question or "(없음)"}
-- 주요 초점(focus): {focus_str or "(없음)"}
+- 주요 초점(focus): {focus_str}
 
 ### 문서 요약 정보
 - 총 청크 수(chunks): {stats.get("chunks", 0)}
@@ -207,46 +222,106 @@ def get_plan_from_gemini(role: str, question: str, focus_list, stats: dict,
 - 조항 내용 일부(요약 스니펫):
 {snippets_lines}
 
-### 최소 판단 기준
-- 문서가 서비스 약관, 계약서, 이용정책 등 “법률 문서”라면 summarizer와 risk를 반드시 포함하라. 
-- 사용자가 질문(question)이나 focus를 입력했으면 qa를 포함하라. 
-- “법무팀”, “검토”, “변호사” 등의 문서를 작성하는 역할(role)이 포함되어 있으면 revision을 포함하라.
-- 문서를 작성하거나 검토하지 않고, 전문 지식 없이 읽는 역할이라면 revision을 포함하지 말아라.
-- 문서가 단순 설명문이나 공지문 수준이라면 summarizer만 포함하라.
+### 최소 판단 기준 (반드시 지켜야 할 규칙)
+- "summarizer" 와 "risk" 는 반드시 포함하라.
+- question 과 focus 가 둘 다 비어 있으면 "qa" 는 절대로 포함하지 마라.
+- question 또는 focus 중 하나라도 비어 있지 않다면 "qa" 를 포함하는 것이 기본이다.
+- 다음 중 하나라도 만족하면 반드시 "revision" 을 포함하라:
+  - 역할(role)에 "작성", "작성자", "수정", "검토", "법무", "리스크", "컴플라이언스" 등
+    문서를 작성/수정/검토하는 역할이 포함된 경우
+  - 사용자 질문(question)에 다음과 같은 수정 의도 키워드가 포함된 경우:
+    "수정", "수정안", "고쳐", "바꿔", "바꾸", "대체", "다듬", "표현 바꿔",
+    "문구 바꿔", "문구 제안", "대체 표현", "대체 문구", "템플릿", "다른 표현",
+    "더 안전한 표현"
+  - focus 는 "revision" 실행 여부에 영향을 주지 않음
+- 문서를 작성하거나 검토하지 않고 단순히 내용을 이해하려는 역할이라면,
+  그리고 question 에 수정 관련 키워드가 없다면 "revision" 을 포함하지 않아도 된다.
 
 ### 출력 형식 (JSON 배열만 반환)
 예:
 ["summarizer", "risk", "qa"]
 """.strip()
 
-        # 1️⃣ Gemini 호출
         res = model.generate_content(prompt)
         raw = (res.text or "").strip()
 
-        # 2️⃣ 코드블록 제거
+        # 코드블럭 제거
         if raw.startswith("```"):
             raw = raw.strip("`").split("\n", 1)[-1].strip()
 
-        # 3️⃣ JSON 파싱
+        # JSON 배열 부분만 추출
         start, end = raw.find("["), raw.rfind("]")
         plan_json = raw[start:end+1] if start != -1 and end != -1 else raw
-        plan = json.loads(plan_json)
+        parsed = json.loads(plan_json)
 
-        # 4️⃣ 유효성 확인
-        if isinstance(plan, list) and all(isinstance(x, str) for x in plan):
-            return plan
-
-        raise ValueError("invalid plan format")
+        if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
+            model_plan = parsed
 
     except Exception as e:
         log.warning(f"[Gemini fallback] {e}")
-        # ✅ 폴백 기본 계획
-        plan = ["summarizer", "risk"]
-        if (question and str(question).strip()) or (focus_list and len(focus_list) > 0):
-            plan.append("qa")
-        if role and any(k in role for k in ["법무", "변호", "검토", "리스크", "컴플라이언스"]):
-            plan.append("revision")
-        return plan
+        # model_plan 이 없어도 됨. 어차피 아래에서 규칙으로 확정할 것.
+
+    # ── 2) 최소 기준 규칙으로 최종 plan 강제 ────────────────
+    q = (question or "").strip()
+    role_text = role or ""
+
+    has_focus = any(str(f or "").strip() for f in focus_list)
+
+    # revision 조건 키워드
+    revision_keywords_role = [
+        "작성", "작성자", "수정", "검토",
+        "법무", "리스크", "컴플라이언스","법무팀",
+    ]
+    revision_keywords_question = [
+        "수정", "수정안", "수정해", "수정해줘",
+        "고쳐", "고쳐줘", "고쳐서",
+        "바꿔", "바꿔줘", "바꾸", "바뀌",
+        "대체", "대체해", "대체 표현", "대체 문구",
+        "다듬", "다듬어", "표현 바꿔", "문구 바꿔",
+        "문구 제안", "다른 표현", "다른 문구",
+        "더 안전한 표현", "템플릿", "템플릿으로",
+        "나은 표현", "낫게", "오탈자", "오타", "길이",
+    ]
+
+    final: list[str] = []
+
+    # 1) summarizer : 항상
+    final.append("summarizer")
+
+    # 2) risk : 항상
+    final.append("risk")
+
+    # 3) qa : question 과 focus 둘 다 비어 있으면 절대 실행하지 않음
+    if q or has_focus:
+        final.append("qa")
+
+    # 4) revision : role 또는 question 키워드로 판단
+    want_revision = False
+
+    # 4-1) role 기반
+    if any(k in role_text for k in revision_keywords_role):
+        want_revision = True
+
+    # 4-2) question 텍스트에 수정 의도 키워드가 하나라도 있으면 무조건 실행
+    if any(k in q for k in revision_keywords_question):
+        want_revision = True
+
+    if want_revision:
+        final.append("revision")
+
+    # 중복 제거 + 순서 유지
+    seen = set()
+    deduped: list[str] = []
+    for w in final:
+        if w not in seen:
+            seen.add(w)
+            deduped.append(w)
+
+    # 참고로 model_plan은 로그로만 보고 싶으면 여기서 출력 가능
+    if model_plan is not None:
+        log.info(f"[Gemini plan suggestion] {model_plan} -> final {deduped}")
+
+    return deduped
 
 # ---------- 실행 레코드 ----------
 def insert_run(cur, session_row: dict, base_run_id, doc_id: int):
